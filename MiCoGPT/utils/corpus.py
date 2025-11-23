@@ -40,6 +40,8 @@ class MiCoGPTokenizer(PreTrainedTokenizer):
     def vocab_size(self):
         return len(self.vocab)
 
+
+
 class MicroCorpus(Dataset):
     def __init__(self, 
                  tokenizer: PreTrainedTokenizer,
