@@ -2,10 +2,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from mgm.src.evaluator import Evaluator
+from MiCoGPT.utils.mgm_evaluator import Evaluator
 import os
 import pickle
-from mgm.src.MicroCorpus import MicroTokenizer, MicroCorpus
+from MiCoGPT.utils.mgm_MicroCorpus import MicroTokenizer, MicroCorpus
 from tqdm import tqdm
 
 def seed_everything(seed: int):

@@ -1,3 +1,8 @@
+"""
+该模块提供用于微生物组（MGnify 等）丰度数据到序列化 token 的转换工具：
+- 轻量级分词器 `MicroTokenizer`
+- 数据集 `MicroCorpus`、`SequenceClassificationDataset`、`MicroCorpusWithLabelTokens`
+"""
 import torch
 from pickle import dump, load
 import pandas as pd
@@ -9,6 +14,12 @@ from typing import Optional, List, Dict, Union, Tuple
 from MiCoGPT.utils.mgm_CLI_utils import find_pkg_resource
 
 class MicroTokenizer(PreTrainedTokenizer):
+    """
+    轻量级分词器：
+    - 使用传入的 `toks` 作为完整词表（包含菌属名与特殊符号）
+    - 兼容 HuggingFace `PreTrainedTokenizer` 接口，便于与 Transformer 模型对接
+    - 默认添加特殊符号：`<pad>`, `<mask>`, `<bos>`, `<eos>`
+    """
     def __init__(self, toks, **kwargs):
         super(MicroTokenizer, self).__init__(**kwargs)
         self.toks = toks
@@ -41,6 +52,13 @@ class MicroTokenizer(PreTrainedTokenizer):
         return len(self.vocab)
 
 class MicroCorpus(Dataset):
+    """
+    将微生物丰度表转换为定长的 token 序列数据集：
+    - 支持从 `h5/csv/tsv/txt` 文件或直接从 `DataFrame` 读取丰度数据
+    - 预处理：仅保留菌属（`g__`），对每个样本提取非零并按丰度降序排列
+    - 使用 `<bos>` 与 `<eos>` 包围序列，随后编码为 id，并做定长填充/截断
+    - 依据系统发育表（均值、标准差）可做归一化；同时保存“零值阈值”用于过滤
+    """
     def __init__(self, 
                  tokenizer: PreTrainedTokenizer,
                  data_path: Optional[str]=None,
@@ -98,6 +116,14 @@ class MicroCorpus(Dataset):
         return len(self.tokens)        
         
     def _convert_to_token(self, sample):
+        """
+        将单个样本（菌属丰度向量）转换为 token 序列：
+        1) 利用预处理阶段保存的“零值阈值”过滤掉“近似零”的条目
+        2) 按丰度降序排列，并取菌属名形成序列
+        3) 在序列首尾分别加入 `<bos>` 与 `<eos>`
+        4) 使用分词器编码为 id，并执行定长填充或截断
+        返回：`(tokens, 原始长度 length)`
+        """
         # set zero values to zero
         sample = sample[sample > self.zero_values]
         sample = sample.sort_values(ascending=False)
@@ -121,6 +147,16 @@ class MicroCorpus(Dataset):
         return tokens, length
     
     def _preprocess(self, data, preprocess):
+        """
+        数据预处理：
+        - 仅保留菌属层级（匹配列名中的 `g__XXX`），并聚合重复菌属
+        - 对齐到系统发育表中出现的菌属集合，不存在的置 0
+        - 删除全零样本；若 `preprocess=False`，返回原始值并以每列最小值作为“零值阈值”
+        - 若 `preprocess=True`：
+          * 按样本行归一化为相对丰度
+          * 以系统发育表的 `mean/std` 进行标准化
+          * 构造一行零向量并经过标准化，得到每列的“零值阈值”，用于下游过滤
+        """
         # data.columns = data.columns.str.replace('; ', ';', regex=False) # remove space after ;
         # data.columns = data.columns.str.replace(';s__.*', '', regex=True) # drop species level
         # data.columns = data.columns.str.replace('^k__', 'sk__', regex=True) # if start with k__, replace with sk__
@@ -146,6 +182,12 @@ class MicroCorpus(Dataset):
         return data, zero_values
     
 class SequenceClassificationDataset(Dataset):
+    """
+    简单的序列分类数据集封装：
+    - `seq`: 已编码好的输入序列（list/ndarray/Tensor）
+    - `mask`: 对应的 attention mask
+    - `labels`: 分类标签（整数或可转换为 Tensor 的序列）
+    """
     def __init__(self, seq, mask, labels):
         self.seq = seq
         self.mask = mask
@@ -162,6 +204,11 @@ class SequenceClassificationDataset(Dataset):
         }
         
 class MicroCorpusWithLabelTokens(Dataset):
+    """
+    在序列中插入标签 token 的数据集：
+    - 将 `labels` 编码为 token id，并在每个序列的 `<bos>` 之后插入
+    - 便于做条件化建模或提示式训练
+    """
     def __init__(self, tokens, labels, tokenizer):
         self.tokens = tokens
         self.tokenizer = tokenizer
