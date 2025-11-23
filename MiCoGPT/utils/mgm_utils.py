@@ -5,7 +5,7 @@ import torch.nn as nn
 from MiCoGPT.utils.mgm_evaluator import Evaluator
 import os
 import pickle
-from MiCoGPT.utils.mgm_MicroCorpus import MicroTokenizer, MicroCorpus
+from MiCoGPT.utils.corpus import MiCoGPTokenizer, MicroCorpus
 from tqdm import tqdm
 
 def seed_everything(seed: int):
@@ -41,8 +41,8 @@ def eval_and_save(y_score, y_true, label_names, save_dir, activation="softmax"):
 
 class CustomUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        if name == 'MicroTokenizer':
-            return MicroTokenizer
+        if name == 'MiCoGPTokenizer':
+            return MiCoGPTokenizer
         return super().find_class(module, name)
 
 def generate(sent, model, tokenizer, do_sample=True, bad_words_ids=None, num_return_sequences=100):
