@@ -3,6 +3,7 @@
 data/
 models/
 tmp/
+MiCoGPT.egg-info/
 notebooks/.ipynb_checkpoints/
 MiCoGPT/__pycache__/
 MiCoGPT/utils/__pycache__/
