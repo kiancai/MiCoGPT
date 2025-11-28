@@ -5,7 +5,7 @@ import torch.nn as nn
 from MiCoGPT.utils.mgm_evaluator import Evaluator
 import os
 import pickle
-from MiCoGPT.utils.corpus import MiCoGPTokenizer, MicroCorpus
+from MiCoGPT.utils.tokenizer import MiCoGPTokenizer
 from tqdm import tqdm
 
 def seed_everything(seed: int):

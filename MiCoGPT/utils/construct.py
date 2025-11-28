@@ -1,23 +1,18 @@
 import pickle
-from configparser import ConfigParser
 from MiCoGPT.utils.corpus import MiCoGPTCorpus
 from importlib.resources import files
+import pandas as pd
 
 def construct(
-    input_path: str,             # 输入丰度表文件
-    output_path: str,            # 输出的 corpus pkl 路径
+    input_path: str,
+    output_path: str,
+    meta_path: str,
     key: str = "genus",
-    no_normalize: bool = False,  # 是否跳过归一化
 ):
 
-    res_dir = files("MiCoGPT")/"resources"
-    tokenizer_path = res_dir/"MiCoGPTokenizer.pkl"
-    config_path = res_dir/"config.ini"
+    tokenizer_path = files("MiCoGPT")/"resources"/"MiCoGPTokenizer.pkl"
 
-    # 获取 max_len 配置
-    cfg = ConfigParser()
-    cfg.read(config_path)
-    max_len = cfg.getint("construct", "max_len")
+    max_len = 512
     print(f"max_len = {max_len}")
 
     # 加载 tokenizer
@@ -25,16 +20,15 @@ def construct(
         tokenizer = pickle.load(f)
     print(f"tokenizer vocab size = {len(tokenizer.vocab)}")
 
-    # 打印归一化提示
-    if not no_normalize:
-        print("Your data will be normalized with the phylogeny mean and std.")
+    meta_df = pd.read_csv(meta_path, sep="\t", index_col="Run")
+    print(f"metadata shape = {meta_df.shape}")
 
     corpus = MiCoGPTCorpus(
         data_path=str(input_path),
+        metadata=meta_df,
         tokenizer=tokenizer,
         key=key,
-        max_len=max_len,
-        preprocess=not no_normalize,
+        max_len=max_len
     )
 
     print(f"corpus length: {len(corpus)}")

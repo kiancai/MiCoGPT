@@ -14,13 +14,6 @@ class MiCoGPTokenizer(PreTrainedTokenizer):
             'bos_token': '<bos>',
             'eos_token': '<eos>',
         })
-
-    # 这里这个函数的作用是？
-    def _tokenize(self, text):
-        return [text]
-    # def _tokenize(self, text):
-    #     return list(text)
-
     
     def _add_tokens(self, new_tokens: List[str], special_tokens: bool = False) -> int:
 
