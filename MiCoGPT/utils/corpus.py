@@ -43,7 +43,7 @@ class MiCoGPTCorpus(Dataset):
             if not metadata.index.is_unique:
                 raise ValueError("metadata.index (sample_id) 必须唯一")
             # 按 self.sample_ids 的顺序对齐 metadata
-            # 如果缺少某些 sample_id，这里会抛 KeyError —— 你可以根据需要改成更宽松的行为
+            # 如果缺少某些 sample_id，这里会抛 KeyError
             try:
                 self.metadata = metadata.loc[self.sample_ids].copy()
             except KeyError as e:
@@ -72,8 +72,6 @@ class MiCoGPTCorpus(Dataset):
     
     def __len__(self):
         return len(self.tokens)        
-
-
 
     def __getitem__(self, index):
         attention_mask = torch.ones(self.tokens[index].shape)
@@ -193,22 +191,4 @@ class SequenceClassificationDataset(Dataset):
             "attention_mask": torch.tensor(self.mask[idx]),
             "labels": torch.tensor(self.labels[idx])
         }
-        
-class MicroCorpusWithLabelTokens(Dataset):
-    def __init__(self, tokens, labels, tokenizer):
-        self.tokens = tokens
-        self.tokenizer = tokenizer
-        self.labels = torch.tensor(self.tokenizer.encode(labels)).view(-1, 1)
-        # insert label tokens after <bos> 
-        self.tokens = torch.cat((self.tokens[:, :1], self.labels, self.tokens[:, 1:-1]), dim=1)
-        
-    def __len__(self):
-        return self.tokens.shape[0]
-    
-    def __getitem__(self, idx):
-        attention_mask = torch.ones(self.tokens[idx].shape)
-        attention_mask[self.tokens[idx] == self.tokenizer.pad_token_id] = 0
-        tokens = self.tokens[idx].clone()
 
-        return {'input_ids': torch.tensor(tokens),
-                'attention_mask': attention_mask}
