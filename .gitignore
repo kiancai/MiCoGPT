@@ -7,4 +7,5 @@ MiCoGPT.egg-info/
 notebooks/.ipynb_checkpoints/
 MiCoGPT/__pycache__/
 MiCoGPT/utils/__pycache__/
-notebooks/DNABERT-S/
+notebooks/DNABERT-S/data/
+notebooks/archive/
