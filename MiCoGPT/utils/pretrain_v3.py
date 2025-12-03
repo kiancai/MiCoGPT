@@ -67,6 +67,8 @@ class GatedPriorEmbedding(nn.Module):
         # 先验向量，固定不训练
         self.register_buffer("prior_matrix", prior_matrix)
         self.g_min = float(g_min)
+        self.alpha_prior = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
 
         vocab_size = prior_matrix.shape[0]
 
@@ -94,7 +96,11 @@ class GatedPriorEmbedding(nn.Module):
         base_emb = self.base(input_ids)                        # [B, T, D]
         prior_emb = self.prior_matrix[input_ids]               # [B, T, D]
         w = self.g_min + (1.0 - self.g_min) * torch.sigmoid(self.gate_logits[input_ids])  # [B, T]
-        return base_emb + w.unsqueeze(-1) * prior_emb
+        # return base_emb + w.unsqueeze(-1) * prior_emb
+        alpha = self.alpha_prior.to(dtype=base_emb.dtype, device=base_emb.device)
+        return base_emb + (alpha * w).unsqueeze(-1) * prior_emb
+
+
 
 
 # PART3: 挂到 GPT2 模型上
@@ -180,8 +186,13 @@ class GatedPriorLMHead(nn.Module):
         w = self.wte.g_min + (1.0 - self.wte.g_min) * torch.sigmoid(self.wte.gate_logits)  # [V]
         w = w.to(dtype=hidden_states.dtype)
 
-        prior_w = self.wte.prior_matrix.to(dtype=hidden_states.dtype) * w.unsqueeze(-1)     # [V,D]
-        logits = logits + self.scale * F.linear(hidden_states, prior_w)                     # [B,T,V]
+        # prior_w = self.wte.prior_matrix.to(dtype=hidden_states.dtype) * w.unsqueeze(-1)     # [V,D]
+        # logits = logits + self.scale * F.linear(hidden_states, prior_w)                     # [B,T,V]
+        alpha = self.wte.alpha_prior.to(dtype=hidden_states.dtype, device=hidden_states.device)
+        w = w * alpha  # 共享同一个 alpha_prior
+        prior_w = self.wte.prior_matrix.to(dtype=hidden_states.dtype) * w.unsqueeze(-1)
+        logits = logits + self.scale * F.linear(hidden_states, prior_w)
+
         return logits
 
 

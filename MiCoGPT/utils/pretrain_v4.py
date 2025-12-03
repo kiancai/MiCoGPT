@@ -48,27 +48,45 @@ def build_prior_matrix_from_npz(tokenizer, npz_path: str, vocab_size: int, n_emb
     return prior, genus_token_ids, missing
 
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 # PART2: Embedding Wrapper
 class GatedPriorEmbedding(nn.Module):
     # 自定义了一个 GatedPriorEmbedding 类，用于替换 GPT2 模型的 embedding 层
-    # E_eff = E_train + w(token) * E_prior
-    # w(token) = g_min + (1-g_min)*sigmoid(gate_logits[token])
+    # E_eff = E_train + w_vec(token) ⊙ E_prior
+    # w_vec(token) = g_min + (1-g_min) * sigmoid(gate_logits[token, :])
+    #
+    # 与原版区别：
+    # - gate_logits 从每 token 一个标量，改为每 token 一个 D 维向量（逐维门控）
+    # - 这样先验可以在不同维度上被不同强度地注入
 
-    def __init__(self, base: nn.Embedding, prior_matrix: torch.Tensor, g_min: float = 0.0, init_w: float = 0.1):
+    def __init__(
+        self,
+        base: nn.Embedding,
+        prior_matrix: torch.Tensor,
+        g_min: float = 0.0,
+        init_w: float = 0.1,
+    ):
         super().__init__()
 
         # 简单参数检查
         if not (0.0 <= g_min < 1.0 and 0.0 < init_w < 1.0 and init_w >= g_min):
-            raise ValueError(f"Invalid parameters: g_min、init_w")
+            raise ValueError("Invalid parameters: g_min、init_w")
 
-        # base 为 GPT2 的 wte 层
+        # base 为 GPT2 的 wte 层（可训练）
         self.base = base
-        # 先验向量，固定不训练
+
+        # 先验向量矩阵，固定不训练（buffer 会跟随 device/dtype 保存与迁移）
+        # 形状: [V, D]
         self.register_buffer("prior_matrix", prior_matrix)
+
         self.g_min = float(g_min)
 
-        vocab_size = prior_matrix.shape[0]
+        vocab_size, n_embd = prior_matrix.shape
 
         # 让 w 的初值约等于 init_w
         # 将 init_w 映射回 gate_logits 的初值：logit( (init_w-g_min)/(1-g_min) )
@@ -76,33 +94,44 @@ class GatedPriorEmbedding(nn.Module):
         inner = min(max(inner, 1e-6), 1 - 1e-6)  # 防止出现 log(0) 或 log(∞)
         logit0 = math.log(inner / (1.0 - inner))
 
-        # 每个 token 一个 gate_logits，初值为 logit0
-        self.gate_logits = nn.Parameter(torch.full((vocab_size,), logit0, dtype=torch.float32))
+        # 每个 token 一个 D 维 gate_logits（逐维门控），初值全为 logit0
+        # 形状: [V, D]
+        self.gate_logits = nn.Parameter(torch.full((vocab_size, n_embd), logit0, dtype=torch.float32))
 
     @property
     def weight(self):
         # 为了保持 GPT2 的 tie_weights 正常工作
+        # HF 的 tie_weights 会用到 get_input_embeddings().weight
         return self.base.weight
 
     def forward(self, input_ids: torch.LongTensor):
-        # 前向传播：计算 E_eff = E_train + w(token) * E_prior
-        # base_emb 为 GPT2 的 wte 层输出，即 E_train
-        # prior_emb 为先验向量，根据 input_ids 索引取出
-        # logits 为每个 token 的 gate_logits，根据 input_ids 索引取出
-        # w 为每个 token 的门控权重，通过 sigmoid 映射到 [g_min, 1]
-        # 返回 E_eff = E_train + w(token) * E_prior
-        base_emb = self.base(input_ids)                        # [B, T, D]
-        prior_emb = self.prior_matrix[input_ids]               # [B, T, D]
-        w = self.g_min + (1.0 - self.g_min) * torch.sigmoid(self.gate_logits[input_ids])  # [B, T]
-        return base_emb + w.unsqueeze(-1) * prior_emb
+        # 前向传播：计算 E_eff = E_train + w_vec(token) ⊙ E_prior
+        #
+        # base_emb: GPT2 的 wte 输出，即 E_train, 形状 [B, T, D]
+        # prior_emb: 先验向量，根据 input_ids 取出, 形状 [B, T, D]
+        # gate_logits[input_ids]: 逐 token、逐维 logits, 形状 [B, T, D]
+        # w_vec: 映射到 [g_min, 1] 的逐维门控, 形状 [B, T, D]
+        #
+        # 返回：E_eff, 形状 [B, T, D]
+        base_emb = self.base(input_ids)          # [B, T, D]
+        prior_emb = self.prior_matrix[input_ids] # [B, T, D]
+
+        # 逐维门控（注意：这里 w 的形状是 [B, T, D]）
+        w = self.g_min + (1.0 - self.g_min) * torch.sigmoid(self.gate_logits[input_ids])  # [B, T, D]
+
+        return base_emb + w * prior_emb
 
 
 # PART3: 挂到 GPT2 模型上
 def attach_gated_prior_to_gpt2(
-    model, tokenizer, npz_path,
-    g_min: float = 0.0, init_w: float = 0.1,
-    shuffle_prior: bool = False, shuffle_seed: int = 42,
-    prior_scale=None,   # None/"p50":自动对齐；float:手动缩放；1.0:不缩放
+    model,
+    tokenizer,
+    npz_path,
+    g_min: float = 0.0,
+    init_w: float = 0.1,
+    shuffle_prior: bool = False,
+    shuffle_seed: int = 42,
+    prior_scale=None,   # None: 自动对齐；float: 手动缩放；1.0: 不缩放
 ):
     vocab_size = model.config.vocab_size
     n_embd = model.config.n_embd
@@ -114,7 +143,7 @@ def attach_gated_prior_to_gpt2(
         n_embd=n_embd,
     )
 
-    # 随机打乱先验向量
+    # 随机打乱先验向量（只在有 prior 的 token 行之间置换）
     if shuffle_prior and len(genus_token_ids) > 1:
         g = torch.Generator(device="cpu")
         g.manual_seed(shuffle_seed)
@@ -123,10 +152,12 @@ def attach_gated_prior_to_gpt2(
         prior_matrix[ids] = prior_matrix[ids[perm]]
         print(f"[prior] shuffled prior vectors among {len(genus_token_ids)} genus tokens (seed={shuffle_seed})")
 
-    # 先拿到 base embedding
+    # 先拿到 base embedding（原始 wte）
     base_wte = model.transformer.wte
 
-    # ====== 对齐 / 手动缩放 prior ======
+    # ====== 对齐 / 手动缩放 prior（全局缩放 prior_matrix）======
+    # 注意：即便门控变成向量，这个“初始化尺度对齐”仍然有意义，
+    # 因为它会影响训练初期 prior 支路的数值量级与 gate 的有效梯度范围。
     with torch.no_grad():
         if isinstance(prior_scale, (int, float)):
             # 手动指定全局缩放系数
@@ -140,15 +171,18 @@ def attach_gated_prior_to_gpt2(
             mask = prior_norm > 0
 
             if mask.any():
-                s = torch.quantile(base_norm[mask], 0.50) / torch.clamp_min(torch.quantile(prior_norm[mask], 0.50), 1e-12)
+                s = torch.quantile(base_norm[mask], 0.50) / torch.clamp_min(
+                    torch.quantile(prior_norm[mask], 0.50), 1e-12
+                )
                 prior_matrix = prior_matrix * s
                 print(f"[prior] applied AUTO scale s={float(s.item()):.4f} to prior_matrix (p50 align)")
             else:
                 print("[prior] no nonzero prior rows found, skip scaling")
 
-    # 再搬到模型设备与 dtype
+    # 搬到模型 device 与 dtype（与 base_wte.weight 对齐）
     prior_matrix = prior_matrix.to(dtype=base_wte.weight.dtype, device=base_wte.weight.device)
 
+    # 用向量门控版本替换 wte
     model.transformer.wte = GatedPriorEmbedding(
         base=base_wte,
         prior_matrix=prior_matrix,
@@ -156,40 +190,50 @@ def attach_gated_prior_to_gpt2(
         init_w=init_w,
     )
 
+    # 继续使用 HF 的 tie_weights：让 lm_head 的 base 权重与 wte.base.weight 共享
     model.tie_weights()
     return genus_token_ids, missing
 
 
-
 class GatedPriorLMHead(nn.Module):
-    # logits = base_lm_head(hidden) + scale * F.linear(hidden, prior_matrix * w[:,None])
+    # 将先验信息也注入到输出 logits：
+    #
+    # logits = base_lm_head(hidden) + scale * (hidden @ prior_w^T)
+    # prior_w = prior_matrix ⊙ w_vec_vocab
+    # w_vec_vocab = g_min + (1-g_min) * sigmoid(gate_logits)   # [V, D]
+    #
+    # 注意：这里的 gate_logits 是“每 token 一个 D 维向量”，因此 prior_w 也是逐维缩放得到的 [V, D]
+
     def __init__(self, base_lm_head: nn.Linear, wte: nn.Module, prior_logits_scale: float = 1.0):
         super().__init__()
-        self.base = base_lm_head      # 仍然是原来的 Linear（保持 tie）
-        self.wte = wte                # 直接引用 GatedPriorEmbedding
+        self.base = base_lm_head      # 原来的 lm_head（保持 tie 的那部分逻辑）
+        self.wte = wte                # 直接引用 GatedPriorEmbedding，从这里读取 prior_matrix / gate_logits / g_min
         self.scale = float(prior_logits_scale)
 
     @property
     def weight(self):
-        # 兼容外部访问 lm_head.weight
+        # 兼容外部访问 lm_head.weight（例如某些保存/检查逻辑）
         return self.base.weight
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.base(hidden_states)  # [B,T,V]
+        # hidden_states: [B, T, D]
+        logits = self.base(hidden_states)  # [B, T, V]
 
-        w = self.wte.g_min + (1.0 - self.wte.g_min) * torch.sigmoid(self.wte.gate_logits)  # [V]
-        w = w.to(dtype=hidden_states.dtype)
+        # vocab 级别、逐维门控：w_vec_vocab 形状 [V, D]
+        w = self.wte.g_min + (1.0 - self.wte.g_min) * torch.sigmoid(self.wte.gate_logits)  # [V, D]
+        w = w.to(dtype=hidden_states.dtype, device=hidden_states.device)
 
-        prior_w = self.wte.prior_matrix.to(dtype=hidden_states.dtype) * w.unsqueeze(-1)     # [V,D]
-        logits = logits + self.scale * F.linear(hidden_states, prior_w)                     # [B,T,V]
+        # prior_w: [V, D]（逐维缩放后的先验“输出权重增量”）
+        prior_w = self.wte.prior_matrix.to(dtype=hidden_states.dtype, device=hidden_states.device) * w  # [V, D]
+
+        # 使用 F.linear: hidden @ prior_w^T -> [B, T, V]
+        logits = logits + self.scale * F.linear(hidden_states, prior_w)
         return logits
 
 
 def attach_gated_prior_lm_head(model, prior_logits_scale: float = 1.0):
-    # 必须在 model.tie_weights() 之后调用（否则 tie 会要求 lm_head 是 Linear）
+    # 必须在 model.tie_weights() 之后调用（否则 tie 会要求 lm_head 还是 nn.Linear）
     model.lm_head = GatedPriorLMHead(model.lm_head, model.transformer.wte, prior_logits_scale)
-
-
 
 
 # 下面是一份计算 val 集合的 balanced_loss 的代码
