@@ -11,3 +11,5 @@ MiCoGPT/utils/archive/
 notebooks/DNABERT-S/data/
 notebooks/archive/
 outputs/
+ai/
+MiCoGPT/utils_vCross/__pycache__/

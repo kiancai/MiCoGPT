@@ -43,3 +43,20 @@ class MiCoGPTokenizer(PreTrainedTokenizer):
     @property
     def vocab_size(self):
         return len(self.vocab)
+
+    def save_vocabulary(self, save_directory: str, filename_prefix: str | None = None) -> tuple[str]:
+        import json
+        import os
+        
+        if not os.path.isdir(save_directory):
+            # logger.error(f"Vocabulary path ({save_directory}) should be a directory")
+            return
+        
+        vocab_file = os.path.join(
+            save_directory, (filename_prefix + "-" if filename_prefix else "") + "vocab.json"
+        )
+        
+        with open(vocab_file, "w", encoding="utf-8") as f:
+            json.dump(self.vocab, f, ensure_ascii=False)
+            
+        return (vocab_file,)
