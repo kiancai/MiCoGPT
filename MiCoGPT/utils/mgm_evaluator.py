@@ -8,7 +8,7 @@ from functools import reduce
 class Evaluator:
 
     def __init__(self, predictions, label_ids, label_names,
-                 num_thresholds=1000, par=None, nafill=0):
+                 num_thresholds=100000, par=None, nafill=0):
         self.predictions = predictions
         # if label_ids is not one-hot encoded, convert it to one-hot encoding
         if len(label_ids.shape) == 1:

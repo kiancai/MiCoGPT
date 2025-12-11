@@ -29,7 +29,7 @@ def eval_and_save(y_score, y_true, label_names, save_dir, activation="softmax"):
     elif activation == "none":
         y_score = torch.tensor(y_score).numpy()
     # y_score = nn.Softmax(dim=1)(torch.tensor(y_score)).numpy()
-    evaluator = Evaluator(y_score, y_true, label_names=label_names, num_thresholds=1000)
+    evaluator = Evaluator(y_score, y_true, label_names=label_names, num_thresholds=100000)
     metrics, avg_metrics = evaluator.eval()
 
     # save
