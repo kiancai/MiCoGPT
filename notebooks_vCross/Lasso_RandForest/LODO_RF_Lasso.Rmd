@@ -1,0 +1,293 @@
+---
+title: "LODO Analysis: Random Forest & Lasso"
+author: "Trae AI"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. 环境准备与数据加载
+
+首先加载必要的 R 包，并读取 Phyloseq 对象。
+
+```{r load_packages}
+library(phyloseq)
+library(tidyverse)
+library(randomForest)
+library(glmnet)      # Lasso
+library(pROC)        # ROC-AUC Calculation
+library(PRROC)       # PR-AUC Calculation
+library(caret)       # Data Splitting & Preprocessing
+
+# 设置随机种子
+set.seed(42)
+
+# 定义文件路径
+rds_path <- "/Users/kiancai/STA24/CWD/STAi/MiCoGPT/data/try2_withCC/ps.16s.grouped_CC_metaReplaced_251129.rds"
+
+# 目标 Studies
+target_studies <- c(
+  'PRJNA439311', 'PRJNA282010', 'PRJNA296567', 
+  'PRJNA632472', 'PRJNA1108737', 'PRJNA820972'
+)
+```
+
+```{r load_data}
+# 加载 RDS 数据
+if (file.exists(rds_path)) {
+  ps <- readRDS(rds_path)
+  print("Phyloseq object loaded successfully.")
+  print(ps)
+} else {
+  stop(paste("File not found:", rds_path))
+}
+```
+
+# 2. 数据提取与预处理
+
+## 2.1 提取 Metadata 和 OTU Table
+
+我们将从 phyloseq 对象中提取样本信息和丰度表，并进行初步清洗。
+
+```{r extract_data}
+# 提取 Metadata
+meta_df <- sample_data(ps) %>% data.frame()
+meta_df$SampleID <- rownames(meta_df)
+
+# 提取 OTU Table (确保 Sample 在行)
+otu_mat <- otu_table(ps)
+if (taxa_are_rows(ps)) {
+  otu_mat <- t(otu_mat)
+}
+otu_df <- as.data.frame(otu_mat)
+otu_df$SampleID <- rownames(otu_df)
+
+# 合并 Metadata 和 OTU Table
+# 注意：这里我们先合并，方便后续筛选
+full_data <- left_join(meta_df, otu_df, by = "SampleID")
+
+# 筛选目标 Studies
+filtered_data <- full_data %>% 
+  filter(Project_ID %in% target_studies) %>%
+  filter(!is.na(Is_Healthy)) # 移除标签缺失的样本
+
+print(paste("Original samples:", nrow(full_data)))
+print(paste("Filtered samples (Target Studies):", nrow(filtered_data)))
+```
+
+## 2.2 数据检查 (Data Inspection)
+
+这里我们将展示每个 Target Study 的样本数量以及健康/疾病的分布情况，以确保数据提取无误。
+
+```{r inspect_studies}
+study_summary <- filtered_data %>%
+  group_by(Project_ID, Is_Healthy) %>%
+  summarise(Count = n(), .groups = 'drop') %>%
+  pivot_wider(names_from = Is_Healthy, values_from = Count, values_fill = 0)
+
+print("Study Summary (Healthy vs Disease counts):")
+print(study_summary)
+
+# 可视化检查
+ggplot(filtered_data, aes(x = Project_ID, fill = as.factor(Is_Healthy))) +
+  geom_bar(position = "dodge") +
+  labs(title = "Sample Distribution per Study", x = "Project ID", y = "Count", fill = "Is Healthy") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 2.3 标签编码与标准化 (TSS)
+
+按照要求：
+1.  **标签编码**: `Is_Healthy == FALSE` -> **1 (Disease)**, `Is_Healthy == TRUE` -> **0 (Healthy)**.
+2.  **TSS 标准化**: 对 OTU 丰度进行相对丰度转换。
+
+```{r preprocessing}
+# 1. 标签编码
+# 确保 Is_Healthy 是逻辑值或字符串，如果是 factor 先转一下
+filtered_data$Label <- ifelse(filtered_data$Is_Healthy == FALSE, 1, 0)
+filtered_data$Label <- as.factor(filtered_data$Label) # 转为因子，用于分类模型
+
+print("Label Encoding:")
+print(table(filtered_data$Is_Healthy, filtered_data$Label))
+
+# 2. 分离特征 (X) 和标签 (Y) 和 Study ID (Group)
+# 找出 OTU 列名 (除去 metadata 列)
+# 假设 otu_table 的列名都在 filtered_data 中
+otu_cols <- colnames(otu_df)[colnames(otu_df) != "SampleID"]
+X_counts <- filtered_data[, otu_cols]
+
+# 3. TSS 标准化 (Relative Abundance)
+# 每一行的和
+row_sums <- rowSums(X_counts)
+# 避免除以 0 (虽然 phyloseq 通常处理过，但安全起见)
+row_sums[row_sums == 0] <- 1 
+X_tss <- sweep(X_counts, 1, row_sums, "/")
+
+# 确认行和为 1
+# print(summary(rowSums(X_tss)))
+
+# 最终的数据集
+final_df <- cbind(
+  Project_ID = filtered_data$Project_ID,
+  Label = filtered_data$Label,
+  X_tss
+)
+
+print(paste("Final feature matrix shape:", nrow(X_tss), "samples x", ncol(X_tss), "features"))
+```
+
+# 3. LODO 模型构建与评估
+
+我们将进行 6 轮循环，每轮选一个 Study 作为测试集，其余 5 个作为训练集。
+
+```{r lodo_loop}
+# 初始化结果列表
+results_list <- list()
+
+for (test_study in target_studies) {
+  cat("\n============================================\n")
+  cat("Processing Test Study:", test_study, "\n")
+  
+  # --- 3.1 划分训练集和测试集 ---
+  test_indices <- which(final_df$Project_ID == test_study)
+  train_indices <- which(final_df$Project_ID != test_study)
+  
+  # 准备训练数据
+  X_train <- final_df[train_indices, otu_cols]
+  y_train <- final_df$Label[train_indices]
+  
+  # 准备测试数据
+  X_test <- final_df[test_indices, otu_cols]
+  y_test <- final_df$Label[test_indices]
+  
+  cat(paste("Train samples:", length(y_train), "| Test samples:", length(y_test), "\n"))
+  
+  # --- 3.2 Random Forest 模型 ---
+  cat("  -> Training Random Forest...\n")
+  
+  # 注意：R 的 randomForest 参数与 sklearn 略有不同，但我们会尽量对应
+  # n_estimators=92 -> ntree=92
+  # max_features='sqrt' -> mtry=sqrt(n_features) (Default)
+  # class_weight='balanced' -> strata / sampsize / classwt (这里使用 classwt 或让 RF 自动处理不平衡)
+  # 这里的实现使用标准 randomForest 包
+  
+  # 计算 class weights (简易版 balanced)
+  # class_counts <- table(y_train)
+  # class_weights <- max(class_counts) / class_counts
+  
+  rf_model <- randomForest(
+    x = X_train,
+    y = y_train,
+    ntree = 92,
+    mtry = floor(sqrt(ncol(X_train))), # max_features='sqrt'
+    importance = FALSE,
+    replace = TRUE,    # bootstrap=True
+    nodesize = 1       # min_samples_leaf=1
+    # classwt = class_weights # R 的 RF classwt 实现较为复杂，通常默认效果已不错
+  )
+  
+  # 预测概率 (取 Positive Class "1" 的概率)
+  rf_pred_prob <- predict(rf_model, X_test, type = "prob")[, "1"]
+  
+  # 计算 AUC (ROC)
+  rf_roc <- roc(y_test, rf_pred_prob, quiet = TRUE)
+  rf_roc_auc <- as.numeric(rf_roc$auc)
+  
+  # 计算 PR-AUC
+  # PRROC 需要正样本和负样本的预测分数分别输入
+  # y_test == "1" 是正样本 (Disease)
+  pos_scores_rf <- rf_pred_prob[y_test == "1"]
+  neg_scores_rf <- rf_pred_prob[y_test == "0"]
+  
+  rf_pr <- pr.curve(scores.class0 = pos_scores_rf, scores.class1 = neg_scores_rf, curve = FALSE)
+  rf_pr_auc <- rf_pr$auc.integral
+  
+  cat(paste("     RF ROC-AUC:", round(rf_roc_auc, 4), "| PR-AUC:", round(rf_pr_auc, 4), "\n"))
+  
+  # --- 3.3 Lasso 模型 ---
+  cat("  -> Training Lasso...\n")
+  
+  # glmnet 需要矩阵输入
+  X_train_mat <- as.matrix(X_train)
+  X_test_mat <- as.matrix(X_test)
+  
+  # Lasso 参数对应:
+  # alpha=1 (Lasso penalty)
+  # lambda: sklearn 使用 alpha=0.001 (control strength). 
+  # glmnet 的 lambda 和 sklearn 的 alpha 定义略有不同:
+  # sklearn: Objective = (1 / (2 * n_samples)) * ||y - Xw||^2_2 + alpha * ||w||_1
+  # glmnet:  Objective = (1/2N) * RSS + lambda * ||w||_1
+  # 所以理论上 sklearn_alpha = glmnet_lambda. 
+  # 但通常我们直接指定 lambda = 0.001 尝试
+  
+  lasso_model <- glmnet(
+    x = X_train_mat,
+    y = y_train,
+    family = "binomial", # Logistic Regression for Classification
+    alpha = 1,           # Lasso
+    lambda = 0.001,      # 对应 sklearn alpha=0.001
+    standardize = FALSE, # 数据已经是 TSS，通常不再标准化，或者设为 TRUE 让 glmnet 自己再做一次 Z-score
+    intercept = TRUE,    # fit_intercept=True
+    thresh = 0.0001,     # tol=0.0001
+    maxit = 1000         # max_iter=1000
+  )
+  
+  # 预测 (响应值，即概率 logits 或 probability)
+  lasso_pred_prob <- predict(lasso_model, newx = X_test_mat, type = "response")
+  lasso_pred_prob <- as.vector(lasso_pred_prob) # 转为向量
+  
+  # 计算 ROC-AUC
+  lasso_roc <- roc(y_test, lasso_pred_prob, quiet = TRUE)
+  lasso_roc_auc <- as.numeric(lasso_roc$auc)
+  
+  # 计算 PR-AUC
+  pos_scores_lasso <- lasso_pred_prob[y_test == "1"]
+  neg_scores_lasso <- lasso_pred_prob[y_test == "0"]
+  
+  lasso_pr <- pr.curve(scores.class0 = pos_scores_lasso, scores.class1 = neg_scores_lasso, curve = FALSE)
+  lasso_pr_auc <- lasso_pr$auc.integral
+  
+  cat(paste("     Lasso ROC-AUC:", round(lasso_roc_auc, 4), "| PR-AUC:", round(lasso_pr_auc, 4), "\n"))
+  
+  # --- 3.4 保存结果 ---
+  results_list[[test_study]] <- data.frame(
+    Test_Study = test_study,
+    RF_ROC_AUC = rf_roc_auc,
+    RF_PR_AUC = rf_pr_auc,
+    Lasso_ROC_AUC = lasso_roc_auc,
+    Lasso_PR_AUC = lasso_pr_auc
+  )
+}
+```
+
+# 4. 结果汇总
+
+展示最终的 LODO 评估结果表。
+
+```{r summary}
+final_results <- bind_rows(results_list)
+
+# 计算均值
+mean_row <- data.frame(
+  Test_Study = "Mean",
+  RF_ROC_AUC = mean(final_results$RF_ROC_AUC),
+  RF_PR_AUC = mean(final_results$RF_PR_AUC),
+  Lasso_ROC_AUC = mean(final_results$Lasso_ROC_AUC),
+  Lasso_PR_AUC = mean(final_results$Lasso_PR_AUC)
+)
+
+final_table <- bind_rows(final_results, mean_row)
+
+print("=== Final LODO Results (AUC) ===")
+print(final_table)
+
+# 保存到 CSV
+write.csv(final_table, "/Users/kiancai/STA24/CWD/STAi/MiCoGPT/notebooks_vCross/Lasso_RandForest/LODO_Results_RF_Lasso.csv", row.names = FALSE)
+```
